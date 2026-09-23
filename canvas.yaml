@@ -1,0 +1,540 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# Lonely Binary GFX — the drawing contract. THE single source of truth.
+#
+# This file is the CONTRACT. It is reviewed, argued with and frozen before the
+# code exists, because once a customer has installed the library the names and
+# the semantics stop being negotiable.
+#
+# v1 ships C++ only (D8). So, unlike panels.yaml, this file does not generate
+# the header -- 30 signatures for a single target is not worth a generator. What
+# it DOES generate is the documentation, where drift is a real problem:
+#
+#     docs/api.md  +  llms.txt      generated from this file
+#     src/LB_Canvas.h               hand-written, reviewed against this file
+#
+# The `py:` spelling on every operation stays even though MicroPython is not in
+# v1. It costs nothing, and deleting it is how the two languages drift apart
+# again -- which is the problem this whole exercise started from.
+# ─────────────────────────────────────────────────────────────────────────────
+version: 1            # frozen 2026-09-23. All seven open questions closed.
+
+# ═════════════════════════════════════════════════════════════════════════════
+# DECISIONS ALREADY TAKEN
+# Recorded here rather than left in a chat log, because the reasoning is worth
+# more than the conclusion.
+# ═════════════════════════════════════════════════════════════════════════════
+decisions:
+
+  - id: D1                                        # closes former Q1
+    date: 2026-09-23
+    what: Constructed objects everywhere. No global singletons.
+    detail: >
+      LonelyBinaryDisplay already does this: `LB_Display display(LB_TFT_24);`.
+      LB_VGA currently exposes a global named `VGA`, which is both inconsistent
+      with the family and far too generic a symbol to be claiming in a library
+      that other people's code links against. So:
+
+          LB_VGA vga(LB_VGA_320x240);
+          vga.begin();
+
+      Consequence: all 13 VGA examples get rewritten. That is real work and it
+      is worth doing now — the same change costs a hundred times more once a
+      customer has written code against the old shape.
+
+  - id: D2                                        # closes former Q6
+    date: 2026-09-23
+    what: The panel abstraction lives in LB_GFX. Five libraries, not six.
+    detail: >
+      LB_Canvas and LB_LVGL both consume a panel, so the panel interface could
+      justify a library of its own (LonelyBinaryPanel). It does not get one:
+      the interface is a couple of hundred bytes of header, and the linker drops
+      whatever drawing code nobody calls — so an LVGL-only sketch that depends
+      on LB_GFX pays compile time for our own ~1500 lines and no flash at all.
+      One fewer thing for a customer to install wins.
+
+      LonelyBinaryLVGL therefore declares `depends=Lonely Binary GFX`.
+      Its coupling to the drawing engine is one call today
+      (`gfx->draw16bitRGBBitmap`, and the zero-copy path does not even do that),
+      so this is a small change to make.
+
+  - id: D3
+    date: 2026-09-23
+    what: One family, five repositories, one naming convention.
+    detail: >
+      `depends=` only resolves through the Arduino Library Manager index, so all
+      five must be registered there; a ZIP install resolves nothing. The `name`
+      field is the identity in that index and CANNOT be changed afterwards.
+    family:
+      # repo                     library.properties name      includes
+      - [LonelyBinaryGFX,      "Lonely Binary GFX",      LonelyBinaryGFX.h]
+      - [LonelyBinaryDisplay,  "Lonely Binary Display",  LonelyBinaryDisplay.h]
+      - [LonelyBinaryVGA,      "Lonely Binary VGA",      LonelyBinaryVGA.h]
+      - [LonelyBinaryEPaper,   "Lonely Binary EPaper",   LonelyBinaryEPaper.h]
+      - [LonelyBinaryLVGL,     "Lonely Binary LVGL",     LonelyBinaryLVGL.h]
+    notes:
+      - The `LB_` prefix belongs to code (classes, macros, colour constants),
+        never to a library name.
+      - Device libraries declare `depends=Lonely Binary GFX (>=1.0.0)`.
+        LB_GFX is the contract; pin its lower bound.
+      - LonelyBinaryGFX is designed first and REGISTERED LAST. Everything
+        depends on it, so its API freezes the moment a customer installs it.
+      - The current LB_VGA library.properties says `name=LB_VGA`. That has to
+        change before it is ever published.
+
+  - id: D4                                        # closes former Q3
+    date: 2026-09-23
+    what: flush(PARTIAL) falls back to FULL silently. supportsPartial() lets you ask.
+    detail: >
+      Returning false would push the problem onto every caller and make portable
+      code impossible to write. Falling back silently keeps one sketch running
+      everywhere. The danger is that on a four-colour panel the fallback blocks
+      for 20-45 seconds and looks exactly like a hang, so:
+        - supportsPartial() exists so code that cares can ask first
+        - the documentation states the blocking time per panel family
+        - this is a documentation obligation, not an API one
+
+  - id: D5                                        # supersedes the reasoning in Q5
+    date: 2026-09-23
+    what: >
+      Bitmap fonts use the U8g2 font FORMAT. efont (BSD-3) supplies CJK. A
+      selected subset ships inside LB_GFX rather than in a separate library.
+    detail: >
+      Measured, not assumed. LovyanGFX carries 120 MB of font source and a clean
+      build of all 107 of its source files takes 58 seconds; the fonts are
+      compiled unconditionally. Despite that:
+        flash   only the sizes actually referenced by setFont() are linked;
+                unreferenced fonts cost zero bytes
+        RAM     zero. Bitmap fonts live in rodata
+        build   58 s once, then Arduino's per-board cache
+      So the earlier argument for a separate LonelyBinaryFonts library -- "a few
+      hundred KB that most customers will never use" -- was simply wrong on the
+      numbers. The only real cost left is repository size, i.e. slower clones,
+      and that is solved by shipping a SUBSET: two or three sizes, no bold or
+      italic, Chinese only. Roughly 2-3 MB rather than efont's full 17 MB for
+      Chinese or 90 MB for all four languages.
+
+      On the format: we want U8g2's font FORMAT, not the U8g2 library. Its
+      encoding is documented and a decoder is on the order of 100 lines --
+      LovyanGFX proves the approach with its own U8g2font class. That gives us
+      access to a very large font catalogue with no dependency at all.
+
+      On licensing, the code licence and the font licence are separate things
+      and must be checked per font:
+        efont        BSD 3-Clause. Commercial and closed use fine. USE THIS.
+        GNU Unifont  GPL-2+ with a font embedding exception (newer: OFL)
+        WenQuanYi    GPL-2 with a font embedding exception
+      The embedding exception is written about embedding a font in a DOCUMENT.
+      Whether firmware is a document is a grey area, and not one worth entering
+      when a BSD-licensed CJK font of equal quality is sitting right there.
+
+  - id: D6                                        # closes former Q2
+    date: 2026-09-23
+    what: The device owns the buffer. LB_Canvas draws into memory it was handed.
+    detail: >
+      It cannot be otherwise: VGA's scan-out ISR reads that exact memory, and a
+      TFT on a board without PSRAM has no buffer at all and goes straight to the
+      bus. So a canvas cannot exist without a device behind it.
+
+      Accepted consequence: an OFF-SCREEN canvas -- for compositing, for double
+      buffering, for rendering something before it is shown -- is a separate
+      v1.1 feature, not something that falls out of v1 for free.
+
+  - id: D7                                        # closes former Q4
+    date: 2026-09-23
+    what: Four-colour e-paper is PAL2 with a READ-ONLY palette.
+    detail: >
+      A four-colour panel shows fixed inks -- black, white, red, yellow -- not a
+      palette anyone can redefine. Modelling it as PAL2 keeps every code path
+      uniform (a paletted canvas is a paletted canvas), and setPaletteColor()
+      returns false there rather than pretending to work. paletteSize() still
+      answers 4, and color() still nearest-matches into those four inks, so a
+      sketch written for a TFT renders on it without changes.
+
+  - id: D8                                        # closes former Q7
+    date: 2026-09-23
+    what: v1 is C++ only. MicroPython is deferred, not abandoned.
+    detail: >
+      Doing both at once doubles the surface to test before anything has been
+      proven on hardware. The C++ side is also where the VGA trial field is.
+
+      !! The risk is explicit: "C++ first" becomes "C++ only" by default, and
+      micropython/st77xx.py drifts further from the C++ API -- which is the
+      exact problem this file was written to fix. What keeps the option alive:
+        - every operation here carries its `py:` spelling, and reviews check it
+        - llms.txt keeps documenting both languages side by side
+        - the day MicroPython is done, this file already says what to build
+      Until then, LonelyBinaryDisplay's llms.txt rule 10 ("do not mix the two
+      language APIs") stays true and stays necessary.
+
+# ═════════════════════════════════════════════════════════════════════════════
+# 1. WHAT THIS IS, AND WHAT IT IS NOT
+# ═════════════════════════════════════════════════════════════════════════════
+scope:
+  is: >
+    A small, stable drawing API that every Lonely Binary display implements:
+    TFT over SPI, VGA over the LCD_CAM parallel bus, and e-paper. Roughly 30
+    operations. It is the thing our tutorials teach, the thing llms.txt
+    documents, and the only surface our customers are expected to learn.
+
+  is_not: >
+    A graphics engine competing with LVGL. LVGL is a retained-mode GUI toolkit
+    with its own widgets, layout and event loop; this is immediate-mode drawing.
+    They sit side by side on top of a panel, neither on top of the other.
+
+  # Why we are writing this rather than adopting an existing one — recorded so
+  # the reasoning survives the people who made the decision.
+  rationale:
+    - >
+      Today the product line speaks three different graphics APIs:
+      LonelyBinaryDisplay -> Arduino_GFX, LB_VGA -> LovyanGFX,
+      e-paper -> GxEPD2 -> Adafruit_GFX. A sketch cannot be moved between our
+      own products, and no shared widget can be written at all.
+    - >
+      GxEPD2 is GPL-3.0 (verified 2026-09 from its LICENSE). It cannot be
+      vendored into an MIT library, and shipping it inside closed firmware is a
+      question we do not want to have. We already write our own e-paper panel
+      drivers because GxEPD2's built-in classes mis-handle BUSY on our panels,
+      so the dependency buys us almost nothing.
+    - >
+      Arduino_GFX's license.txt is verbatim Adafruit's BSD licence, "Copyright
+      (c) 2012 Adafruit Industries". LovyanGFX's license.txt likewise records
+      incorporated Adafruit_GFX and TFT_eSPI code. Every available engine
+      carries a competitor's copyright notice; vendoring one keeps that notice
+      in our source tree. Writing our own is the only route that does not.
+    - >
+      The size of the job is smaller than it looks. The MicroPython side is
+      already dependency-free and implements this whole surface by hand
+      (micropython/st77xx.py). The VGA library, across 13 examples, uses only
+      about 20 distinct engine calls.
+
+# ═════════════════════════════════════════════════════════════════════════════
+# 2. THE PANEL — what a device library provides, and what everything consumes
+# ═════════════════════════════════════════════════════════════════════════════
+#
+# LB_GFX and LB_LVGL both sit on this. A device library (LonelyBinaryDisplay,
+# LonelyBinaryVGA, LonelyBinaryEPaper) implements it.
+#
+# Per D2 this interface SHIPS INSIDE LB_GFX — it does not get a library of its
+# own. Both consumers therefore depend on LB_GFX, and the linker drops whatever
+# drawing code a given sketch never calls.
+#
+#                    LB_Panel  (buffer / size / format / flush)
+#                       ^                        ^
+#                  LB_Canvas                 LB_LVGL
+#                (this file)              (vendored LVGL)
+#
+panel:
+  provides:
+    - name: width / height
+      note: In the CURRENT rotation. Several panels ship rotated, so this is not
+            the glass size, and it changes when rotation does.
+    - name: buffer
+      note: >
+        Pointer to the pixel buffer, or null for a device that draws straight to
+        the bus with no RAM copy (a TFT on a board with no PSRAM). Code that
+        pokes the buffer must handle null.
+    - name: format
+      note: See `pixel_formats` below.
+    - name: stride
+      note: Bytes per row. NOT always width*bytes-per-pixel — sub-byte formats
+            round up to a whole byte.
+    - name: flush
+      note: See the `flush` operation. This is the one that hurts on e-paper.
+
+  pixel_formats:
+    - id: RGB565
+      bits: 16
+      note: TFT, and VGA's 320x240 mode.
+    - id: PAL4
+      bits: 4
+      note: >
+        16-colour palette. VGA's 640x480 mode. Two pixels per byte;
+        the LEFT (even) pixel is the HIGH nibble.
+    - id: PAL1
+      bits: 1
+      note: Black/white e-paper.
+    - id: PAL2
+      bits: 2
+      note: >
+        Four-colour e-paper (black / white / red / yellow depending on panel).
+        Whether these are really "a palette" or four fixed inks is question Q4.
+
+# ═════════════════════════════════════════════════════════════════════════════
+# 3. COLOUR — the hardest design decision in this file
+# ═════════════════════════════════════════════════════════════════════════════
+colour:
+  # The choice: one colour type everywhere, quantised by the canvas.
+  model: >
+    Every operation takes an lb_color_t, produced by color(r,g,b) or one of the
+    named constants. It is logically 24-bit RGB; each canvas quantises it to
+    whatever its panel can actually show.
+
+  why: >
+    The alternative — a colour type per canvas — means a sketch written for a
+    TFT does not compile for e-paper, which defeats the whole point. Taking RGB
+    and quantising means one sketch runs everywhere and simply looks coarser on
+    coarser hardware.
+
+  cost: >
+    On a paletted canvas, color() is a nearest-match against the palette. This
+    is resolved ONCE PER SHAPE, not per pixel — fillRect() converts the colour
+    before it touches a single byte — so the cost is a 16-entry search per
+    drawing call and is not measurable. Per-pixel loops are already the wrong
+    thing to write (see performance_notes).
+
+  escape_hatch:
+    name: indexColor(i)
+    note: >
+      Paletted canvases only. Means "palette entry i", no matching, no
+      quantisation. For palette-cycling effects and for code that owns the
+      palette. Returns an error colour on a non-paletted canvas rather than
+      silently meaning something else.
+
+  named_constants: >
+    LB_BLACK LB_WHITE LB_RED LB_GREEN LB_BLUE LB_YELLOW LB_CYAN LB_MAGENTA
+    LB_ORANGE LB_GRAY LB_DARKGRAY LB_LIGHTGRAY. Deliberately short — these have
+    to look right on a 2-colour e-paper as well as on a TFT, and a long list of
+    subtle shades does not survive quantisation to black and white.
+
+# ═════════════════════════════════════════════════════════════════════════════
+# 4. OPERATIONS
+#
+#   cpp / py  — the two idiomatic spellings. They are DELIBERATELY different:
+#               C++ follows the Arduino_GFX / Adafruit / LovyanGFX convention
+#               that customers already know, MicroPython follows the framebuf
+#               convention that MicroPython users already know. Forcing one
+#               spelling on both languages breaks knowledge transfer on the side
+#               that loses. What is unified is the OPERATION SET and the
+#               SEMANTICS, not the letters.
+# ═════════════════════════════════════════════════════════════════════════════
+operations:
+
+  # ── surface ────────────────────────────────────────────────────────────────
+  - cpp: width
+    py: width
+    args: []
+    returns: int
+    note: Width in the current rotation.
+
+  - cpp: height
+    py: height
+    args: []
+    returns: int
+
+  - cpp: setRotation
+    py: set_rotation
+    args: [rotation 0..3]
+    note: >
+      Swaps width/height on odd rotations. Costs nothing on a TFT (a MADCTL
+      bit); on VGA and e-paper it is applied in software while drawing.
+
+  - cpp: fillScreen
+    py: fill
+    args: [color]
+
+  - cpp: flush
+    py: flush
+    args: [mode = FULL | PARTIAL]
+    note: >
+      !! THIS IS THE CALL THAT BEHAVES DIFFERENTLY ON EVERY DEVICE !!
+        TFT drawing direct to the bus   no-op, pixels were already sent
+        TFT with a PSRAM framebuffer    pushes the frame, a few ms
+        VGA                             no-op, the scan-out ISR reads the buffer
+        e-paper                         BLOCKS FOR SECONDS. Measured on our own
+                                        panels: 1.5 s mono, 20-45 s colour.
+      The contract is: ALWAYS call flush(). It is a no-op where it is not
+      needed, and it is the only way a portable sketch can exist at all.
+      PARTIAL is honoured only where supportsPartial() is true; elsewhere it
+      silently means FULL. (Should it be silent? See Q3.)
+
+  - cpp: supportsPartial
+    py: supports_partial
+    args: []
+    returns: bool
+
+  - cpp: sleep
+    py: sleep
+    args: []
+    note: >
+      Deep sleep / hibernate. Required on e-paper (leaving the panel powered
+      damages it over time); a no-op elsewhere. On e-paper this DISCARDS the
+      previous-frame memory, so partial refresh cannot be used after it.
+
+  # ── pixels and lines ───────────────────────────────────────────────────────
+  - cpp: drawPixel
+    py: pixel
+    args: [x, y, color]
+
+  - cpp: drawFastHLine
+    py: hline
+    args: [x, y, w, color]
+
+  - cpp: drawFastVLine
+    py: vline
+    args: [x, y, h, color]
+
+  - cpp: drawLine
+    py: line
+    args: [x0, y0, x1, y1, color]
+
+  # ── rectangles ─────────────────────────────────────────────────────────────
+  - cpp: drawRect
+    py: rect
+    args: [x, y, w, h, color]
+  - cpp: fillRect
+    py: fill_rect
+    args: [x, y, w, h, color]
+    note: The single most-used call in all 13 VGA examples. Its speed is the
+          library's reputation; see performance_notes.
+  - cpp: drawRoundRect
+    py: round_rect
+    args: [x, y, w, h, r, color]
+  - cpp: fillRoundRect
+    py: fill_round_rect
+    args: [x, y, w, h, r, color]
+
+  # ── circles and triangles ──────────────────────────────────────────────────
+  - cpp: drawCircle
+    py: circle
+    args: [cx, cy, r, color]
+  - cpp: fillCircle
+    py: fill_circle
+    args: [cx, cy, r, color]
+  - cpp: drawTriangle
+    py: triangle
+    args: [x0, y0, x1, y1, x2, y2, color]
+  - cpp: fillTriangle
+    py: fill_triangle
+    args: [x0, y0, x1, y1, x2, y2, color]
+
+  # ── text ───────────────────────────────────────────────────────────────────
+  - cpp: setFont
+    py: set_font
+    args: [font]
+    note: >
+      Bitmap fonts only in v1, in the U8g2 font format (see D5). Chinese comes
+      from efont, which is BSD-3 licensed; a two-or-three-size subset ships
+      inside LB_GFX. Unreferenced fonts cost zero flash, so the catalogue can
+      grow without every sketch paying for it.
+
+  - cpp: setTextColor
+    py: set_text_color
+    args: [fg, bg = TRANSPARENT]
+    note: >
+      Two-argument form fills the glyph box with bg, which is what makes a
+      changing number not leave fragments of the previous one behind.
+
+  - cpp: setTextSize
+    py: set_text_size
+    args: [scale]
+    note: Integer scaling only. A bitmap font scaled by 2.5 looks like a mistake.
+
+  - cpp: drawString
+    py: text
+    args: [string, x, y]
+    returns: int (x advanced to)
+    note: >
+      UTF-8 in, always. An ASCII-only font renders unknown codepoints as a
+      placeholder box rather than as mojibake, so adding a CJK font later is not
+      a breaking change.
+
+  - cpp: textWidth
+    py: text_width
+    args: [string]
+    returns: int
+    note: For centring. Never nudge an x coordinate by eye.
+
+  - cpp: fontHeight
+    py: font_height
+    args: []
+    returns: int
+
+  # ── images ─────────────────────────────────────────────────────────────────
+  - cpp: drawRGB565
+    py: blit
+    args: [x, y, w, h, data]
+    note: >
+      Raw pixels, quantised by the canvas like any other colour. On e-paper a
+      photo will be dithered to 2 or 4 inks — that is the honest result, not a
+      failure.
+
+  - cpp: drawJpg
+    py: draw_jpg
+    args: [data, len, x, y, scale = 1.0]
+    note: >
+      Baseline JPEG only. TJpgDec (ChaN) is vendored — the same decoder
+      LovyanGFX uses, a single self-contained C file designed for embedding.
+      Progressive JPEGs fail silently and produce a blank area; the asset tool
+      checks the SOF marker on every conversion.
+      Measured cost on VGA: 59 ms for a full 320x240 screen, about 3.5 frames.
+
+  # ── palette (paletted canvases only) ───────────────────────────────────────
+  - cpp: setPaletteColor
+    py: set_palette_color
+    args: [index, r, g, b]
+    note: >
+      Changing the palette recolours everything already drawn, with no pixels
+      touched. Measured on VGA 640x480: rotating 14 entries takes 5 us against
+      282 ms to repaint the same picture — 56000x. This is the whole reason the
+      16-colour mode is worth having, and it must survive into LB_GFX.
+
+  - cpp: paletteSize
+    py: palette_size
+    args: []
+    returns: int
+    note: 0 on a direct-colour canvas.
+
+# ═════════════════════════════════════════════════════════════════════════════
+# 5. DELIBERATELY NOT IN v1
+# ═════════════════════════════════════════════════════════════════════════════
+# Each of these is achievable — see the notes — but v1 ships a small surface we
+# can guarantee on every panel. Adding is easy; removing is not.
+not_in_v1:
+  - name: anti-aliased shapes
+    cost: ~150 lines, coverage-based. The hardest of this list, and not mysterious.
+  - name: rotate / zoom blitting
+    cost: ~100 lines, inverse affine mapping with nearest or bilinear sampling.
+  - name: QOI decode
+    cost: >
+      ~300 lines. The QOI spec fits on one page and the format was designed to
+      be re-implementable in an afternoon. Worth doing early: it is lossless and
+      decodes far faster than JPEG, which would directly attack the 59 ms
+      full-screen decode that currently forces photos to paint in from the top.
+  - name: screenshot
+    cost: >
+      ~20 lines, and it should be done SOON. Dump the buffer over serial and
+      convert on the PC — no PNG encoder needed. This turns "flash it and ask a
+      human to look at the screen" into something automatic, which is the single
+      biggest time sink in display work.
+  - name: text datum / padding
+    cost: Small, but it changes the meaning of every drawString x,y. v1.1.
+  - name: scroll, clipping, gradients, alpha, QR
+  - name: anything retained-mode
+    note: That is LVGL's job. Not this file's.
+
+# ═════════════════════════════════════════════════════════════════════════════
+# 6. PERFORMANCE NOTES THAT ARE PART OF THE CONTRACT
+# ═════════════════════════════════════════════════════════════════════════════
+performance_notes:
+  - >
+    Sub-byte formats (PAL4, PAL2, PAL1) must fill BYTE-ALIGNED runs with memset
+    and handle only the two ragged ends nibble-by-nibble. Getting this wrong
+    does not break anything visibly — it just makes the 16-colour mode slow, and
+    the 16-colour mode has no other reason to exist.
+  - >
+    Per-pixel drawing through the public API is always slow, in every engine.
+    Measured with LovyanGFX on VGA: 0.92 us per pixel, 282 ms for a full
+    640x480 screen. Most of that is per-call overhead, not the pixel write. The
+    documentation must steer people to fillRect / drawString / drawJpg.
+  - >
+    Colour conversion happens once per shape, never per pixel.
+
+# ═════════════════════════════════════════════════════════════════════════════
+# 7. OPEN QUESTIONS
+# ═════════════════════════════════════════════════════════════════════════════
+# None. Q1->D1, Q2->D6, Q3->D4, Q4->D7, Q5->D5, Q6->D2, Q7->D8.
+# Numbers are never reused, so "see Q6" in an old commit still means the same.
+#
+# The contract is frozen at version 1. Changing anything above now means a
+# deliberate version bump and a migration note, not an edit.
+open_questions: []
